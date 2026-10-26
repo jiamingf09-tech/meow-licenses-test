@@ -3,11 +3,17 @@ on:
   schedule:
     - cron: '17 */6 * * *'
   workflow_dispatch:
+    inputs:
+      test_alert:
+        description: 'Only test the failure alerts (email and issue); nothing is published'
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths: ['v1/catalog.json', 'v1/delegation.json', 'v1/trust.json', 'automation/publish-status.mjs']
 permissions:
   contents: write
+  issues: write
 concurrency:
   group: signed-license-status
   cancel-in-progress: false
@@ -18,6 +24,11 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Simulate a failure to test the alerts
+        if: inputs.test_alert
+        run: |
+          echo "::error::Alert test requested; skipping publication."
+          exit 1
       - name: Publish limited-lifetime status
         env:
           TRADINGMEOW_STATUS_PRIVATE_KEY: ${{ secrets.TRADINGMEOW_STATUS_PRIVATE_KEY }}
@@ -30,3 +41,48 @@ jobs:
           git diff --cached --quiet && exit 0
           git commit -m 'Refresh signed authorization status'
           git push origin HEAD:main
+      - name: Check published status still has two days left
+        run: node automation/status-health.mjs 48
+      # Every client stops 72 hours after the last good status, so a failure must reach the publisher quickly.
+      # Email needs the Secrets TRADINGMEOW_ALERT_SMTP_USERNAME and TRADINGMEOW_ALERT_SMTP_PASSWORD
+      # (for Gmail: the account address and an app password). The issue is a second channel that works without them.
+      - name: Email the publisher about the failure
+        if: failure()
+        env:
+          SMTP_USERNAME: ${{ secrets.TRADINGMEOW_ALERT_SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.TRADINGMEOW_ALERT_SMTP_PASSWORD }}
+          SMTP_URL: smtps://smtp.gmail.com:465
+          ALERT_TO: jiamingf09@gmail.com
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TEST_PREFIX: ${{ inputs.test_alert && '[测试] ' || '' }}
+        run: |
+          if [ -z "$SMTP_USERNAME" ] || [ -z "$SMTP_PASSWORD" ]; then
+            echo "::warning::Alert email is not configured (TRADINGMEOW_ALERT_SMTP_USERNAME / TRADINGMEOW_ALERT_SMTP_PASSWORD)."
+            exit 0
+          fi
+          remaining=$(node automation/status-health.mjs 0 2>/dev/null | sed -n 's/^remaining=//p')
+          subject=$(printf '%s' "${TEST_PREFIX}TradingMeow 授权状态发布失败（剩余约 ${remaining:-未知} 小时）" | base64 -w0)
+          {
+            printf 'From: TradingMeow License Monitor <%s>\r\n' "$SMTP_USERNAME"
+            printf 'To: %s\r\n' "$ALERT_TO"
+            printf 'Subject: =?UTF-8?B?%s?=\r\n' "$subject"
+            printf 'MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n'
+            printf '仓库 %s 的签名授权状态刷新失败。\r\n\r\n' "$GITHUB_REPOSITORY"
+            printf '当前已发布状态剩余有效期：约 %s 小时。到期后所有客户端会停止业务，直到发布新的状态。\r\n\r\n' "${remaining:-未知}"
+            printf '运行记录：%s\r\n\r\n' "$RUN_URL"
+            printf '处理办法：检查 TRADINGMEOW_STATUS_PRIVATE_KEY 和状态密钥有效期，修复后在 Actions 手动运行本工作流，或用本地管理工具重新发布。\r\n'
+          } > alert-mail.txt
+          curl --silent --show-error --ssl-reqd --url "$SMTP_URL" --user "$SMTP_USERNAME:$SMTP_PASSWORD" \
+            --mail-from "$SMTP_USERNAME" --mail-rcpt "$ALERT_TO" --upload-file alert-mail.txt
+      - name: Open or update a failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TEST_PREFIX: ${{ inputs.test_alert && '[测试] ' || '' }}
+        run: |
+          title="${TEST_PREFIX}授权状态发布失败"
+          body="签名授权状态刷新失败，请尽快处理（客户端在上一份状态到期后停止业务）。运行记录：$RUN_URL"
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"; fi

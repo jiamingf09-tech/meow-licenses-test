@@ -97,6 +97,15 @@ export function createSnapshot({ catalogBytes, delegationBytes, trustBytes, priv
     signature: sign('sha256', signedBytes('status', delegation.keyId, payload), { key, dsaEncoding: 'ieee-p1363' }).toString('base64') }));
 }
 
+// Hours left before the currently published status stops authorizing clients (negative once expired).
+// The payload is read without verification: this only drives operator alerts, never authorization.
+export function statusRemainingHours(statusBytes, now = new Date()) {
+  const document = strictParse(statusBytes);
+  requireValue(document?.format === 1 && document.kind === 'status', 'Not a status document');
+  const payload = strictParse(decode(document.payload));
+  return (date(payload.expiresUtc) - now.getTime()) / 3600000;
+}
+
 async function main() {
   const directory = resolve(process.argv[2] || '.');
   const key = process.env.TRADINGMEOW_STATUS_PRIVATE_KEY;

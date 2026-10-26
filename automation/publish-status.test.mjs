@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, sign, verify, createPublicKey } from 'node:crypto';
-import { createSnapshot } from './publish-status.mjs';
+import { createSnapshot, statusRemainingHours } from './publish-status.mjs';
 
 const now = new Date('2026-10-21T12:00:00Z');
 function signed(kind, keyId, value, privateKey) {
@@ -130,4 +130,12 @@ test('correctly signed duplicate and escaped duplicate payload fields are reject
     const catalogBytes = encode({ format: 1, kind: 'catalog', keyId: 'root', payload: raw.toString('base64'), signature: signature.toString('base64') });
     assert.throws(() => createSnapshot({ ...input, catalogBytes }), /Duplicate JSON property/);
   }
+});
+
+test('remaining validity of a freshly published status is the full signed lifetime', () => {
+  const { input } = fixture();
+  const bytes = createSnapshot(input);
+  assert.equal(statusRemainingHours(bytes, now), 72);
+  assert.equal(statusRemainingHours(bytes, new Date(now.getTime() + 80 * 3600000)), -8);
+  assert.throws(() => statusRemainingHours(Buffer.from('{"format":1,"kind":"catalog","keyId":"x","payload":"e30=","signature":""}'), now));
 });
